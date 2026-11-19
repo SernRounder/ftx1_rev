@@ -1,0 +1,428 @@
+diff --git a/common/monitor.c b/common/monitor.c
+index 6bd228a..f24082f 100644
+--- a/common/monitor.c
++++ b/common/monitor.c
+@@ -52,8 +52,9 @@ static void waterfall_free(ftx_waterfall_t* me)
+     free(me->mag);
+ }
+ 
+-void monitor_init(monitor_t* me, const monitor_config_t* cfg)
++int monitor_init(monitor_t* me, const monitor_config_t* cfg)
+ {
++    *me = (monitor_t){0};
+     float slot_time = (cfg->protocol == FTX_PROTOCOL_FT4) ? FT4_SLOT_TIME : FT8_SLOT_TIME;
+     float symbol_period = (cfg->protocol == FTX_PROTOCOL_FT4) ? FT4_SYMBOL_PERIOD : FT8_SYMBOL_PERIOD;
+     // Compute DSP parameters that depend on the sample rate
+@@ -64,6 +65,8 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
+     // const int len_window = 1.8f * me->block_size; // hand-picked and optimized
+ 
+     me->window = (float*)malloc(me->nfft * sizeof(me->window[0]));
++    if (!me->window)
++        goto no_memory;
+     for (int i = 0; i < me->nfft; ++i)
+     {
+         // window[i] = 1;
+@@ -73,6 +76,8 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
+         // me->window[i] = (i < len_window) ? hann_i(i, len_window) : 0;
+     }
+     me->last_frame = (float*)calloc(me->nfft, sizeof(me->last_frame[0]));
++    if (!me->last_frame)
++        goto no_memory;
+ 
+     LOG(LOG_INFO, "Block size = %d\n", me->block_size);
+     LOG(LOG_INFO, "Subblock size = %d\n", me->subblock_size);
+@@ -80,7 +85,11 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
+     size_t fft_work_size = 0;
+     kiss_fftr_alloc(me->nfft, 0, 0, &fft_work_size);
+     me->fft_work = malloc(fft_work_size);
++    if (!me->fft_work)
++        goto no_memory;
+     me->fft_cfg = kiss_fftr_alloc(me->nfft, 0, me->fft_work, &fft_work_size);
++    if (!me->fft_cfg)
++        goto no_memory;
+ 
+     LOG(LOG_INFO, "N_FFT = %d\n", me->nfft);
+     LOG(LOG_DEBUG, "FFT work area = %zu\n", fft_work_size);
+@@ -91,7 +100,11 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
+     size_t ifft_work_size = 0;
+     kiss_fft_alloc(me->nifft, 1, 0, &ifft_work_size);
+     me->ifft_work = malloc(ifft_work_size);
++    if (!me->ifft_work)
++        goto no_memory;
+     me->ifft_cfg = kiss_fft_alloc(me->nifft, 1, me->ifft_work, &ifft_work_size);
++    if (!me->ifft_cfg)
++        goto no_memory;
+ 
+     LOG(LOG_INFO, "N_iFFT = %d\n", me->nifft);
+     LOG(LOG_DEBUG, "iFFT work area = %zu\n", ifft_work_size);
+@@ -105,17 +118,27 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
+     const int num_bins = me->max_bin - me->min_bin;
+ 
+     waterfall_init(&me->wf, max_blocks, num_bins, cfg->time_osr, cfg->freq_osr);
++    if (!me->wf.mag)
++        goto no_memory;
+     me->wf.protocol = cfg->protocol;
+ 
+     me->symbol_period = symbol_period;
+ 
+     me->max_mag = -120.0f;
++    return 1;
++
++no_memory:
++    monitor_free(me);
++    return 0;
+ }
+ 
+ void monitor_free(monitor_t* me)
+ {
+     waterfall_free(&me->wf);
+     free(me->fft_work);
++#ifdef WATERFALL_USE_PHASE
++    free(me->ifft_work);
++#endif
+     free(me->last_frame);
+     free(me->window);
+ }
+@@ -139,7 +162,6 @@ void monitor_process(monitor_t* me, const float* frame)
+     // Loop over block subdivisions
+     for (int time_sub = 0; time_sub < me->wf.time_osr; ++time_sub)
+     {
+-        kiss_fft_scalar timedata[me->nfft];
+         kiss_fft_cpx freqdata[me->nfft / 2 + 1];
+ 
+         // Shift the new data into analysis frame
+@@ -154,11 +176,13 @@ void monitor_process(monitor_t* me, const float* frame)
+         }
+ 
+         // Do DFT of windowed analysis frame
+-        for (int pos = 0; pos < me->nfft; ++pos)
++        for (int pair = 0; pair < me->nfft / 2; ++pair)
+         {
+-            timedata[pos] = me->window[pos] * me->last_frame[pos];
++            const int pos = 2 * pair;
++            freqdata[pair].r = me->window[pos] * me->last_frame[pos];
++            freqdata[pair].i = me->window[pos + 1] * me->last_frame[pos + 1];
+         }
+-        kiss_fftr(me->fft_cfg, timedata, freqdata);
++        kiss_fftr_packed(me->fft_cfg, freqdata, freqdata);
+ 
+         // Loop over possible frequency OSR offsets
+         for (int freq_sub = 0; freq_sub < me->wf.freq_osr; ++freq_sub)
+diff --git a/common/monitor.h b/common/monitor.h
+index dd70d8d..f27f934 100644
+--- a/common/monitor.h
++++ b/common/monitor.h
+@@ -46,7 +46,7 @@ typedef struct
+ #endif
+ } monitor_t;
+ 
+-void monitor_init(monitor_t* me, const monitor_config_t* cfg);
++int monitor_init(monitor_t* me, const monitor_config_t* cfg);
+ void monitor_reset(monitor_t* me);
+ void monitor_process(monitor_t* me, const float* frame);
+ void monitor_free(monitor_t* me);
+@@ -59,4 +59,4 @@ void monitor_resynth(const monitor_t* me, const candidate_t* candidate, float* s
+ }
+ #endif
+ 
+-#endif // _INCLUDE_MONITOR_H_
+\ No newline at end of file
++#endif // _INCLUDE_MONITOR_H_
+diff --git a/demo/decode_ft8.c b/demo/decode_ft8.c
+index dcb0299..1dce460 100644
+--- a/demo/decode_ft8.c
++++ b/demo/decode_ft8.c
+@@ -334,7 +334,11 @@ int main(int argc, char** argv)
+ 
+     hashtable_init();
+ 
+-    monitor_init(&mon, &mon_cfg);
++    if (!monitor_init(&mon, &mon_cfg))
++    {
++        fprintf(stderr, "Cannot allocate FT8 decoder buffers\n");
++        return -1;
++    }
+     LOG(LOG_DEBUG, "Waterfall allocated %d symbols\n", mon.wf.max_blocks);
+ 
+     do
+diff --git a/fft/_kiss_fft_guts.h b/fft/_kiss_fft_guts.h
+index bf5d53c..f928968 100644
+--- a/fft/_kiss_fft_guts.h
++++ b/fft/_kiss_fft_guts.h
+@@ -126,12 +126,24 @@ struct kiss_fft_state{
+ #  define KISS_FFT_COS(phase) _mm_set1_ps( cos(phase) )
+ #  define KISS_FFT_SIN(phase) _mm_set1_ps( sin(phase) )
+ #  define HALF_OF(x) ((x)*_mm_set1_ps(.5))
++#elif defined(FT8_RADIO)
++#  define KISS_FFT_COS(phase) cosf(phase)
++#  define KISS_FFT_SIN(phase) sinf(phase)
++#  define HALF_OF(x) ((x)*.5f)
+ #else
+ #  define KISS_FFT_COS(phase) (kiss_fft_scalar) cos(phase)
+ #  define KISS_FFT_SIN(phase) (kiss_fft_scalar) sin(phase)
+ #  define HALF_OF(x) ((x)*.5)
+ #endif
+ 
++#ifdef FT8_RADIO
++typedef float kf_phase_t;
++#define KF_PI 3.14159265358979323846f
++#else
++typedef double kf_phase_t;
++#define KF_PI 3.141592653589793238462643383279502884
++#endif
++
+ #define  kf_cexp(x,phase) \
+ 	do{ \
+ 		(x)->r = KISS_FFT_COS(phase);\
+diff --git a/fft/kiss_fft.c b/fft/kiss_fft.c
+index af2f695..1a84b68 100644
+--- a/fft/kiss_fft.c
++++ b/fft/kiss_fft.c
+@@ -303,8 +303,6 @@ static
+ void kf_factor(int n,int * facbuf)
+ {
+     int p=4;
+-    double floor_sqrt;
+-    floor_sqrt = floor( sqrt((double)n) );
+ 
+     /*factor out powers of 4, powers of 2, then any remaining primes */
+     do {
+@@ -314,7 +312,7 @@ void kf_factor(int n,int * facbuf)
+                 case 2: p = 3; break;
+                 default: p += 2; break;
+             }
+-            if (p > floor_sqrt)
++            if (p > n / p)
+                 p = n;          /* no more factors, skip to end */
+         }
+         n /= p;
+@@ -349,8 +347,7 @@ kiss_fft_cfg kiss_fft_alloc(int nfft,int inverse_fft,void * mem,size_t * lenmem
+         st->inverse = inverse_fft;
+ 
+         for (i=0;i<nfft;++i) {
+-            const double pi=3.141592653589793238462643383279502884197169399375105820974944;
+-            double phase = -2*pi*i / nfft;
++            kf_phase_t phase = -2 * KF_PI * i / nfft;
+             if (st->inverse)
+                 phase *= -1;
+             kf_cexp(st->twiddles+i, phase );
+diff --git a/fft/kiss_fftr.c b/fft/kiss_fftr.c
+index 8102132..09348f8 100644
+--- a/fft/kiss_fftr.c
++++ b/fft/kiss_fftr.c
+@@ -49,8 +49,7 @@ kiss_fftr_cfg kiss_fftr_alloc(int nfft,int inverse_fft,void * mem,size_t * lenme
+     kiss_fft_alloc(nfft, inverse_fft, st->substate, &subsize);
+ 
+     for (i = 0; i < nfft/2; ++i) {
+-        double phase =
+-            -3.14159265358979323846264338327 * ((double) (i+1) / nfft + .5);
++        kf_phase_t phase = -KF_PI * ((kf_phase_t)(i + 1) / nfft + (kf_phase_t)0.5);
+         if (inverse_fft)
+             phase *= -1;
+         kf_cexp (st->super_twiddles+i,phase);
+@@ -60,7 +59,11 @@ kiss_fftr_cfg kiss_fftr_alloc(int nfft,int inverse_fft,void * mem,size_t * lenme
+ 
+ void kiss_fftr(kiss_fftr_cfg st,const kiss_fft_scalar *timedata,kiss_fft_cpx *freqdata)
+ {
+-    /* input buffer timedata is stored row-wise */
++    kiss_fftr_packed(st, (const kiss_fft_cpx*)timedata, freqdata);
++}
++
++void kiss_fftr_packed(kiss_fftr_cfg st, const kiss_fft_cpx *time_pairs, kiss_fft_cpx *freqdata)
++{
+     int k,ncfft;
+     kiss_fft_cpx fpnk,fpk,f1k,f2k,tw,tdc;
+ 
+@@ -72,7 +75,7 @@ void kiss_fftr(kiss_fftr_cfg st,const kiss_fft_scalar *timedata,kiss_fft_cpx *fr
+     ncfft = st->substate->nfft;
+ 
+     /*perform the parallel fft of two real signals packed in real,imag*/
+-    kiss_fft( st->substate , (const kiss_fft_cpx*)timedata, st->tmpbuf );
++    kiss_fft( st->substate , time_pairs, st->tmpbuf );
+     /* The real part of the DC element of the frequency spectrum in st->tmpbuf
+      * contains the sum of the even-numbered elements of the input time sequence
+      * The imag part is the sum of the odd-numbered elements
+diff --git a/fft/kiss_fftr.h b/fft/kiss_fftr.h
+index 588948d..8685d2b 100644
+--- a/fft/kiss_fftr.h
++++ b/fft/kiss_fftr.h
+@@ -40,6 +40,10 @@ void kiss_fftr(kiss_fftr_cfg cfg,const kiss_fft_scalar *timedata,kiss_fft_cpx *f
+  output freqdata has nfft/2+1 complex points
+ */
+ 
++/* Pack even samples in .r and odd samples in .i. The forward FFT consumes
++   all nfft/2 input pairs before writing output, so both pointers may alias. */
++void kiss_fftr_packed(kiss_fftr_cfg cfg, const kiss_fft_cpx *time_pairs, kiss_fft_cpx *freqdata);
++
+ void kiss_fftri(kiss_fftr_cfg cfg,const kiss_fft_cpx *freqdata,kiss_fft_scalar *timedata);
+ /*
+  input freqdata has  nfft/2+1 complex points
+diff --git a/ft8/decode.c b/ft8/decode.c
+index efb1718..a1235c3 100644
+--- a/ft8/decode.c
++++ b/ft8/decode.c
+@@ -189,8 +189,13 @@ static int ft4_sync_score(const ftx_waterfall_t* wf, const ftx_candidate_t* cand
+ 
+ int ftx_find_candidates(const ftx_waterfall_t* wf, int num_candidates, ftx_candidate_t heap[], int min_score)
+ {
++#ifdef FTX_FT8_ONLY
++    int (*sync_fun)(const ftx_waterfall_t*, const ftx_candidate_t*) = ft8_sync_score;
++    const int num_tones = 8;
++#else
+     int (*sync_fun)(const ftx_waterfall_t*, const ftx_candidate_t*) = (wf->protocol == FTX_PROTOCOL_FT4) ? ft4_sync_score : ft8_sync_score;
+     int num_tones = (wf->protocol == FTX_PROTOCOL_FT4) ? 4 : 8;
++#endif
+ 
+     int heap_size = 0;
+     ftx_candidate_t candidate;
+@@ -327,11 +332,13 @@ static void ftx_normalize_logl(float* log174)
+ bool ftx_decode_candidate(const ftx_waterfall_t* wf, const ftx_candidate_t* cand, int max_iterations, ftx_message_t* message, ftx_decode_status_t* status)
+ {
+     float log174[FTX_LDPC_N]; // message bits encoded as likelihood
++#ifndef FTX_FT8_ONLY
+     if (wf->protocol == FTX_PROTOCOL_FT4)
+     {
+         ft4_extract_likelihood(wf, cand, log174);
+     }
+     else
++#endif
+     {
+         ft8_extract_likelihood(wf, cand, log174);
+     }
+@@ -366,6 +373,7 @@ bool ftx_decode_candidate(const ftx_waterfall_t* wf, const ftx_candidate_t* cand
+     // Reuse CRC value as a hash for the message (TODO: 14 bits only, should perhaps use full 16 or 32 bits?)
+     message->hash = status->crc_calculated;
+ 
++#ifndef FTX_FT8_ONLY
+     if (wf->protocol == FTX_PROTOCOL_FT4)
+     {
+         // '[..] for FT4 only, in order to avoid transmitting a long string of zeros when sending CQ messages,
+@@ -376,6 +384,7 @@ bool ftx_decode_candidate(const ftx_waterfall_t* wf, const ftx_candidate_t* cand
+         }
+     }
+     else
++#endif
+     {
+         for (int i = 0; i < 10; ++i)
+         {
+@@ -589,4 +598,4 @@ static void pack_bits(const uint8_t bit_array[], int num_bits, uint8_t packed[])
+             ++byte_idx;
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/ft8/ldpc.c b/ft8/ldpc.c
+index 539a1df..b41826c 100644
+--- a/ft8/ldpc.c
++++ b/ft8/ldpc.c
+@@ -127,6 +127,85 @@ static int ldpc_check(uint8_t codeword[])
+     return errors;
+ }
+ 
++#ifdef FTX_LDPC_FIXED_POINT
++/* Normalized min-sum for processors without fast floating point. Keep LLRs
++   positive for bit 1, matching bp_decode and the likelihood extractor. */
++void bp_decode(float codeword[], int max_iters, uint8_t plain[], int* ok)
++{
++    int16_t channel[FTX_LDPC_N];
++    int16_t check_to_bit[FTX_LDPC_N][3] = {0};
++    int belief[FTX_LDPC_N];
++    uint8_t edge[FTX_LDPC_M][7];
++    *ok = FTX_LDPC_M;
++
++    for (int n = 0; n < FTX_LDPC_N; ++n)
++    {
++        const float x = codeword[n];
++        channel[n] = x > 16.0f ? 4096 : x < -16.0f ? -4096 : x == x ? (int16_t)(x * 256.0f) : 0;
++    }
++    for (int m = 0; m < FTX_LDPC_M; ++m)
++    {
++        for (int i = 0; i < kFTX_LDPC_Num_rows[m]; ++i)
++        {
++            const int n = kFTX_LDPC_Nm[m][i] - 1;
++            for (int j = 0; j < 3; ++j)
++                if (kFTX_LDPC_Mn[n][j] == m + 1)
++                    edge[m][i] = (uint8_t)j;
++        }
++    }
++
++    for (int iter = 0; iter < max_iters; ++iter)
++    {
++        int ones = 0;
++        for (int n = 0; n < FTX_LDPC_N; ++n)
++        {
++            belief[n] = channel[n] + check_to_bit[n][0] + check_to_bit[n][1] + check_to_bit[n][2];
++            plain[n] = belief[n] > 0;
++            ones += plain[n];
++        }
++        if (!ones)
++            break;
++        const int errors = ldpc_check(plain);
++        if (errors < *ok)
++            *ok = errors;
++        if (!errors)
++            return;
++
++        for (int m = 0; m < FTX_LDPC_M; ++m)
++        {
++            const int row_size = kFTX_LDPC_Num_rows[m];
++            int positive[7];
++            int parity = 0;
++            int min1 = 32767, min2 = 32767, min_index = 0;
++            for (int i = 0; i < row_size; ++i)
++            {
++                const int n = kFTX_LDPC_Nm[m][i] - 1;
++                const int extrinsic = belief[n] - check_to_bit[n][edge[m][i]];
++                positive[i] = extrinsic > 0;
++                parity ^= positive[i];
++                const int magnitude = extrinsic < 0 ? -extrinsic : extrinsic;
++                if (magnitude < min1)
++                {
++                    min2 = min1;
++                    min1 = magnitude;
++                    min_index = i;
++                }
++                else if (magnitude < min2)
++                {
++                    min2 = magnitude;
++                }
++            }
++            for (int i = 0; i < row_size; ++i)
++            {
++                const int n = kFTX_LDPC_Nm[m][i] - 1;
++                const int mag = i == min_index ? min2 : min1;
++                const int scaled = (3 * mag) / 4;
++                check_to_bit[n][edge[m][i]] = (int16_t)((parity ^ positive[i]) ? scaled : -scaled);
++            }
++        }
++    }
++}
++#else
+ void bp_decode(float codeword[], int max_iters, uint8_t plain[], int* ok)
+ {
+     float tov[FTX_LDPC_N][3];
+@@ -211,6 +290,7 @@ void bp_decode(float codeword[], int max_iters, uint8_t plain[], int* ok)
+ 
+     *ok = min_errors;
+ }
++#endif
+ 
+ // Ideas for approximating tanh/atanh:
+ // * https://varietyofsound.wordpress.com/2011/02/14/efficient-tanh-computation-using-lamberts-continued-fraction/
+diff --git a/stpcpy_shim.h b/stpcpy_shim.h
+new file mode 100644
+index 0000000..2c66f79
+--- /dev/null
++++ b/stpcpy_shim.h
+@@ -0,0 +1,10 @@
++#ifndef STPCPY_SHIM_H
++#define STPCPY_SHIM_H
++#include <string.h>
++static inline char *stpcpy_shim(char *dest, const char *src) {
++    const size_t size = strlen(src);
++    memcpy(dest, src, size + 1);
++    return dest + size;
++}
++#define stpcpy stpcpy_shim
++#endif

@@ -1,0 +1,6 @@
+pyelftools==0.32
+unicorn==2.1.4
+numpy==1.26.4
+scipy==1.15.2
+Pillow==11.1.0
+capstone==6.0.0a3
